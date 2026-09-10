@@ -1,7 +1,7 @@
 {
   "task_id": "python-example",
   "language": "python",
-  "source": "def handle(params):\n    print('processing', params['cluster_uuid'])\n    return {'cluster_uuid': params['cluster_uuid'], 'dry_run': params['dry_run']}\n",
+  "source": "def run(params):\n    print('processing', params['cluster_uuid'])\n    return {'status': 'succeeded', 'data': {'cluster_uuid': params['cluster_uuid'], 'dry_run': params['dry_run']}, 'error': None}\n",
   "params": {"cluster_uuid": "cluster-001", "dry_run": false},
   "timeout_seconds": 30
 }

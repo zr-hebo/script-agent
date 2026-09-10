@@ -1,7 +1,7 @@
 {
   "task_id": "go-example",
   "language": "go",
-  "source": "package usercode\nimport (\"context\"; \"fmt\")\nfunc Handle(ctx context.Context, params map[string]any) (map[string]any, error) {\n if err := ctx.Err(); err != nil { return nil, err }; fmt.Println(\"processing\", params[\"cluster_uuid\"]); return params, nil\n}",
+  "source": "package usercode\nimport (\"context\"; \"fmt\"; \"github.com/zr-hebo/script-agent/sdk\")\ntype Task struct { sdk.BaseTask }\nfunc New() sdk.TaskRunner { return &Task{} }\nfunc (t *Task) Run(ctx context.Context, params map[string]any) sdk.Outcome {\n if err := ctx.Err(); err != nil { return sdk.Outcome{Status:sdk.StatusCancelled,Error:err} }; fmt.Println(\"processing\", params[\"cluster_uuid\"]); return sdk.Outcome{Status:sdk.StatusSucceeded,Data:params}\n}",
   "params": {"cluster_uuid": "cluster-001", "dry_run": true},
   "timeout_seconds": 30
 }

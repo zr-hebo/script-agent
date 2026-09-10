@@ -112,7 +112,7 @@ import "context"
 func Handle(ctx context.Context, p map[string]interface{}) (map[string]interface{}, error) { panic("go boom") }`, "go boom"},
 		{"python exception", "python", "def handle(params):\n    raise ValueError('python boom')", "python boom"},
 		{"python syntax", "python", "def handle(:", "SyntaxError"},
-		{"python signature", "python", "x = 1", "expected def handle"},
+		{"python signature", "python", "x = 1", "expected def run"},
 		{"python result", "python", "def handle(params):\n    return [1, 2]", "dict or None"},
 		{"python exit zero without result", "python", "import os\ndef handle(params):\n    os._exit(0)", "missing result"},
 		{"shell exit", "shell", "echo shell-boom >&2\nexit 7", "exit status 7"},
@@ -126,7 +126,7 @@ func Handle(ctx context.Context, p map[string]interface{}) (map[string]interface
 			if result.Status != "failed" || result.Outcome.Error == nil {
 				t.Fatalf("%+v", result)
 			}
-			if !strings.Contains(result.Outcome.Error.Message, tc.contains) {
+			if !strings.Contains(result.Outcome.Error.Error(), tc.contains) {
 				t.Fatalf("%+v, stderr=%s", result.Outcome.Error, result.Outcome.Stderr)
 			}
 			if result.Phases[2].Status != "succeeded" {
@@ -135,10 +135,10 @@ func Handle(ctx context.Context, p map[string]interface{}) (map[string]interface
 			if strings.Contains(result.Outcome.Stdout, "should-not-run") {
 				t.Fatal(result.Outcome.Stdout)
 			}
-			if tc.name == "go panic" && result.Outcome.Error.Stack == "" {
+			if tc.name == "go panic" && result.Outcome.Stack == "" {
 				t.Fatal("missing Go panic stack")
 			}
-			if tc.name == "python exception" && !strings.Contains(result.Outcome.Error.Stack, "Traceback") {
+			if tc.name == "python exception" && !strings.Contains(result.Outcome.Stack, "Traceback") {
 				t.Fatal("missing Python traceback")
 			}
 			if tc.name == "shell pipefail" && !strings.Contains(result.Outcome.Stderr, "line=") {

@@ -128,6 +128,9 @@ func TestValidationAndAuth(t *testing.T) {
 		`{"language":"shell","source":"true","params":[]}`,
 		`{"language":"shell","source":"true","timeout_seconds":-1}`,
 		`{"language":"shell","source":"true","timeout_seconds":3601}`,
+		`{"language":"shell","source":"true","post_run_timeout_seconds":-1}`,
+		`{"language":"shell","source":"true","post_run_timeout_seconds":61}`,
+		`{"language":"python","source":"pass","prepare_source":"true"}`,
 		`{"language":"shell","source":"true","extra":1}`,
 		`{"language":"shell","source":"true"} {}`,
 		`{"language":"shell","source":"true","callback_url":"http://127.0.0.1/admin"}`,
@@ -139,6 +142,26 @@ func TestValidationAndAuth(t *testing.T) {
 	large, _ := json.Marshal(agent.Request{Language: "shell", Source: strings.Repeat("x", 600<<10)})
 	if w := request(s, "POST", "/v1/executions", large); w.Code != 400 {
 		t.Fatal(w.Code)
+	}
+}
+
+func TestHTTPNewLifecycleProtocol(t *testing.T) {
+	s := testServer(t, 1, 2, agent.CallbackConfig{})
+	item := submitTask(t, s, agent.Request{Language: "python", PostRunTimeoutSeconds: 1, Source: `def prepare(p):
+    p["prepared"] = True
+def run(p):
+    assert p["prepared"]
+    return {"status":"failed", "data":None, "error":"business failure"}
+def post_run(p,out):
+    assert out["error"] == "business failure"
+    raise ValueError("cleanup failure")
+`})
+	finished := waitFor(t, s, item.ExecutionID, func(e Execution) bool { return e.FinishedAt != nil })
+	if finished.Status != "failed" || finished.Result.Outcome.Error.Error() != "business failure" || finished.Result.UserPostRun.Error == nil {
+		t.Fatalf("%+v", finished.Result)
+	}
+	if finished.Result.Phases[0].Status != "succeeded" || finished.Result.Phases[1].Status != "failed" || finished.Result.Phases[2].Status != "failed" {
+		t.Fatal(finished.Result.Phases)
 	}
 }
 

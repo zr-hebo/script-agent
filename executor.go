@@ -13,11 +13,21 @@ import (
 	"time"
 
 	"github.com/zr-hebo/script-agent/internal/runner"
+	"github.com/zr-hebo/script-agent/sdk"
 )
 
 type Request = runner.Request
-type Outcome = runner.Result
-type ExecutionError = runner.ExecutionError
+type Outcome = sdk.Outcome
+type TaskRunner = sdk.TaskRunner
+type BaseTask = sdk.BaseTask
+type Status = sdk.Status
+
+const (
+	StatusSucceeded = sdk.StatusSucceeded
+	StatusFailed    = sdk.StatusFailed
+	StatusTimedOut  = sdk.StatusTimedOut
+	StatusCancelled = sdk.StatusCancelled
+)
 
 type Config struct {
 	// Path to the standalone script-agent binary used as a disposable Go helper.
@@ -43,6 +53,7 @@ type Result struct {
 	Phase       string         `json:"phase"`
 	Phases      []PhaseResult  `json:"phases"`
 	Outcome     Outcome        `json:"outcome"`
+	UserPostRun Outcome        `json:"user_post_run"`
 	Callback    CallbackResult `json:"callback"`
 }
 
@@ -161,33 +172,42 @@ func (e *Executor) ExecuteWithObserver(ctx context.Context, executionID string, 
 		}
 	}
 	transition("prepare")
+	result.UserPostRun.Status = "skipped"
 	normalized, err := e.Validate(req)
 	if err != nil {
-		result.Outcome = Outcome{Status: "failed", Error: &ExecutionError{Type: "invalid_request", Message: err.Error()}}
+		result.Outcome = Outcome{Status: StatusFailed, Error: fmt.Errorf("invalid_request: %w", err)}
 	} else {
-		result.Outcome = e.runner.ExecuteWithPhase(ctx, normalized, func(name string) {
-			if name != "prepare" {
-				transition(name)
+		report := e.runner.ExecuteWithPhase(ctx, normalized, func(name string) {
+			if name == "post-run" && current == 0 {
+				result.Phases[1].Status = "skipped"
 			}
+			transition(name)
 		})
+		result.Outcome, result.UserPostRun = report.Outcome, report.UserPostRun
 	}
-	result.Status = result.Outcome.Status
-	result.Phases[current].Status = result.Status
-	if current == 0 {
+	result.Status = string(result.Outcome.Status)
+	primaryPhase := 0
+	if result.Phases[1].StartedAt != nil {
+		primaryPhase = 1
+	}
+	result.Phases[primaryPhase].Status = result.Status
+	if result.Phases[1].StartedAt == nil {
 		result.Phases[1].Status = "skipped"
 	}
-	transition("post-run")
+	if current != 2 {
+		transition("post-run")
+	}
 	if req.CallbackURL != "" {
 		// Delivery is deliberately independent of the cancelled execution context.
 		result.Callback = e.callback.send(req.CallbackURL, CallbackEvent{
 			Event: "task.completed", TaskID: req.TaskID, ExecutionID: executionID,
-			Phase: "post-run", Status: result.Status, Outcome: result.Outcome,
+			Phase: "post-run", Status: result.Status, Outcome: result.Outcome, UserPostRun: result.UserPostRun,
 		})
 	}
 	now := time.Now().UTC()
 	result.Phases[2].FinishedAt = &now
 	result.Phases[2].Status = "succeeded"
-	if result.Callback.Status == "failed" {
+	if result.Callback.Status == "failed" || (result.UserPostRun.Status != "succeeded" && result.UserPostRun.Status != "skipped") {
 		result.Phases[2].Status = "failed"
 	}
 	return result

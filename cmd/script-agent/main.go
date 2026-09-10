@@ -99,7 +99,7 @@ func run() int {
 			fmt.Fprintln(os.Stderr, err)
 			return 1
 		}
-		if result.Status != "succeeded" || result.Callback.Status == "failed" {
+		if result.Status != "succeeded" || result.Phases[2].Status == "failed" {
 			return 1
 		}
 		return 0

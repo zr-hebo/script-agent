@@ -33,10 +33,12 @@ func main() {
 	result := executor.Execute(ctx, agent.Request{
 		TaskID: "embedded-example", Language: "go",
 		Source: `package usercode
-import "context"
-func Handle(ctx context.Context, params map[string]any) (map[string]any, error) {
-    if err := ctx.Err(); err != nil { return nil, err }
-    return params, nil
+import ("context"; "github.com/zr-hebo/script-agent/sdk")
+type Task struct { sdk.BaseTask }
+func New() sdk.TaskRunner { return &Task{} }
+func (t *Task) Run(ctx context.Context, params map[string]any) sdk.Outcome {
+    if err := ctx.Err(); err != nil { return sdk.Outcome{Status:sdk.StatusCancelled,Error:err} }
+    return sdk.Outcome{Status:sdk.StatusSucceeded,Data:params}
 }`,
 		Params: map[string]any{"cluster_uuid": "cluster-001", "dry_run": true},
 	})
@@ -44,7 +46,7 @@ func Handle(ctx context.Context, params map[string]any) (map[string]any, error) 
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
-	if result.Status != "succeeded" || result.Callback.Status == "failed" {
+	if result.Status != "succeeded" || result.Phases[2].Status == "failed" {
 		os.Exit(1)
 	}
 }

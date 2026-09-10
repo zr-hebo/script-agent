@@ -1,7 +1,10 @@
 {
   "task_id": "shell-example",
   "language": "shell",
+  "prepare_source": "echo ready > prepared.txt",
   "source": "python3 - <<'PY'\nimport json, os\nwith open(os.environ['SCRIPT_PARAMS_FILE'], encoding='utf-8') as f:\n    params = json.load(f)\nprint('processing', params['cluster_uuid'])\nwith open(os.environ['SCRIPT_RESULT_FILE'], 'w', encoding='utf-8') as f:\n    json.dump(params, f)\nPY\n",
   "params": {"cluster_uuid": "cluster-001", "dry_run": true},
-  "timeout_seconds": 30
+  "post_run_source": "test -f prepared.txt\npython3 - <<'PY'\nimport json, os\nwith open(os.environ['SCRIPT_OUTCOME_FILE']) as f:\n    outcome = json.load(f)\nprint('cleanup after', outcome['status'])\nPY",
+  "timeout_seconds": 30,
+  "post_run_timeout_seconds": 10
 }

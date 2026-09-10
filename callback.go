@@ -17,7 +17,7 @@ type CallbackConfig struct {
 	AllowedOrigins []string
 	// Optional credential belongs to the supervisor and is never passed to scripts.
 	BearerToken string
-	Timeout     time.Duration // total post-run budget; default 10 seconds
+	Timeout     time.Duration // callback-only budget, after user PostRun; default 10 seconds
 	Attempts    int           // bounded delivery attempts; default 3, maximum 5
 }
 
@@ -35,6 +35,7 @@ type CallbackEvent struct {
 	Phase       string  `json:"phase"`
 	Status      string  `json:"status"`
 	Outcome     Outcome `json:"outcome"`
+	UserPostRun Outcome `json:"user_post_run"`
 }
 
 type callbackSender struct {

@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"strings"
 	"time"
+
+	"github.com/zr-hebo/script-agent/sdk"
 )
 
 const (
@@ -17,12 +19,15 @@ const (
 )
 
 type Request struct {
-	TaskID         string         `json:"task_id,omitempty"`
-	CallbackURL    string         `json:"callback_url,omitempty"`
-	Language       string         `json:"language"`
-	Source         string         `json:"source"`
-	Params         map[string]any `json:"params"`
-	TimeoutSeconds int            `json:"timeout_seconds"`
+	TaskID                string         `json:"task_id,omitempty"`
+	CallbackURL           string         `json:"callback_url,omitempty"`
+	Language              string         `json:"language"`
+	Source                string         `json:"source"`
+	PrepareSource         string         `json:"prepare_source,omitempty"`
+	PostRunSource         string         `json:"post_run_source,omitempty"`
+	Params                map[string]any `json:"params"`
+	TimeoutSeconds        int            `json:"timeout_seconds"`
+	PostRunTimeoutSeconds int            `json:"post_run_timeout_seconds,omitempty"`
 }
 
 // Normalize also snapshots Params, so concurrent executions do not share maps.
@@ -30,8 +35,17 @@ func (r Request) Normalize() (Request, error) {
 	if r.Language != "go" && r.Language != "shell" && r.Language != "python" {
 		return r, fmt.Errorf("language must be go, shell or python")
 	}
-	if strings.TrimSpace(r.Source) == "" || len(r.Source) > MaxSourceBytes {
+	if strings.TrimSpace(r.Source) == "" || len(r.Source)+len(r.PrepareSource)+len(r.PostRunSource) > MaxSourceBytes {
 		return r, fmt.Errorf("source must contain 1..%d bytes", MaxSourceBytes)
+	}
+	if r.Language != "shell" && (r.PrepareSource != "" || r.PostRunSource != "") {
+		return r, fmt.Errorf("prepare_source and post_run_source apply only to shell")
+	}
+	if r.PostRunTimeoutSeconds == 0 {
+		r.PostRunTimeoutSeconds = 10
+	}
+	if r.PostRunTimeoutSeconds < 1 || r.PostRunTimeoutSeconds > 60 {
+		return r, fmt.Errorf("post_run_timeout_seconds must be 1..60")
 	}
 	if r.TimeoutSeconds == 0 {
 		r.TimeoutSeconds = DefaultTimeout
@@ -57,26 +71,13 @@ func (r Request) Normalize() (Request, error) {
 	return r, nil
 }
 
-type ExecutionError struct {
-	Type    string `json:"type"`
-	Message string `json:"message"`
-	Stack   string `json:"stack,omitempty"`
-}
-
 type Result struct {
-	Status          string          `json:"status"`
-	Data            map[string]any  `json:"data"`
-	Error           *ExecutionError `json:"error"`
-	ExitCode        *int            `json:"exit_code"`
-	Stdout          string          `json:"stdout"`
-	Stderr          string          `json:"stderr"`
-	StdoutTruncated bool            `json:"stdout_truncated"`
-	StderrTruncated bool            `json:"stderr_truncated"`
-	DurationMS      int64           `json:"duration_ms"`
+	sdk.Outcome
+	UserPostRun sdk.Outcome
 }
 
 func failure(kind string, err error) Result {
-	return Result{Status: "failed", Error: &ExecutionError{Type: kind, Message: err.Error()}}
+	return Result{Outcome: sdk.Outcome{Status: sdk.StatusFailed, Error: fmt.Errorf("%s: %w", kind, err)}, UserPostRun: sdk.Outcome{Status: "skipped"}}
 }
 
 func timeoutDuration(r Request) time.Duration {
