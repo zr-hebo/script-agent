@@ -38,6 +38,10 @@ func run() int {
 	flags := flag.NewFlagSet(os.Args[1], flag.ContinueOnError)
 	listen := flags.String("listen", "127.0.0.1:8080", "HTTP listen address (serve)")
 	file := flags.String("file", "-", "request JSON file; - reads stdin (run)")
+	source := flags.String("source", "", "script source file; cannot be combined with --file (run)")
+	language := flags.String("language", "go", "source language: go, shell, python (with --source)")
+	params := flags.String("params", "{}", "JSON object of script parameters (with --source)")
+	streamLogs := flags.Bool("stream-logs", true, "stream script stdout/stderr to stderr (run); use --stream-logs=false to disable")
 	concurrency := flags.Int("concurrency", 4, "maximum active executions including post-run")
 	capacity := flags.Int("capacity", 128, "maximum retained executions (oldest finished entry is evicted)")
 	origins := flags.String("callback-origins", "", "comma-separated allowed callback origins, e.g. https://batch.example.com")
@@ -50,6 +54,18 @@ func run() int {
 		fmt.Fprintln(os.Stderr, "unexpected positional arguments")
 		return 2
 	}
+	provided := make(map[string]bool)
+	flags.Visit(func(f *flag.Flag) { provided[f.Name] = true })
+	if os.Args[1] != "run" && provided["stream-logs"] {
+		fmt.Fprintln(os.Stderr, "--stream-logs applies only to run")
+		return 2
+	}
+	if (provided["source"] && (*source == "" || provided["file"])) ||
+		((provided["language"] || provided["params"]) && !provided["source"]) ||
+		(os.Args[1] != "run" && (provided["source"] || provided["language"] || provided["params"])) {
+		fmt.Fprintln(os.Stderr, "use run --source PATH [--language go|shell|python] [--params JSON]; cannot combine with --file")
+		return 2
+	}
 	executable, err := os.Executable()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
@@ -57,6 +73,14 @@ func run() int {
 	}
 	config := agent.Config{GoExecutable: executable, BashPath: *bash, PythonPath: *python,
 		Callback: agent.CallbackConfig{BearerToken: os.Getenv("SCRIPT_AGENT_CALLBACK_TOKEN")}}
+	var logs *logStream
+	if os.Args[1] == "run" && *streamLogs {
+		// A closed stderr pipe must not terminate the supervisor via SIGPIPE.
+		signal.Ignore(syscall.SIGPIPE)
+		logs = newLogStream(os.Stderr)
+		config.LogWriter = logs
+		defer logs.Close()
+	}
 	if *origins != "" {
 		for _, origin := range strings.Split(*origins, ",") {
 			config.Callback.AllowedOrigins = append(config.Callback.AllowedOrigins, strings.TrimSpace(origin))
@@ -68,33 +92,45 @@ func run() int {
 		return 2
 	}
 	if os.Args[1] == "run" {
-		var input io.Reader = os.Stdin
-		if *file != "-" {
-			f, err := os.Open(*file)
+		var req agent.Request
+		if *source != "" {
+			var err error
+			req, err = sourceRequest(*source, *language, *params)
 			if err != nil {
 				fmt.Fprintln(os.Stderr, err)
 				return 2
 			}
-			defer f.Close()
-			input = f
-		}
-		data, err := io.ReadAll(io.LimitReader(input, (512<<10)+1))
-		if err != nil || len(data) > 512<<10 {
-			fmt.Fprintln(os.Stderr, "request unreadable or exceeds 512 KiB")
-			return 2
-		}
-		decoder := json.NewDecoder(strings.NewReader(string(data)))
-		decoder.DisallowUnknownFields()
-		var req agent.Request
-		if err := decoder.Decode(&req); err != nil {
-			fmt.Fprintln(os.Stderr, err)
-			return 2
-		}
-		if err := decoder.Decode(new(any)); !errors.Is(err, io.EOF) {
-			fmt.Fprintln(os.Stderr, "expected a single JSON object")
-			return 2
+		} else {
+			var input io.Reader = os.Stdin
+			if *file != "-" {
+				f, err := os.Open(*file)
+				if err != nil {
+					fmt.Fprintln(os.Stderr, err)
+					return 2
+				}
+				defer f.Close()
+				input = f
+			}
+			data, err := io.ReadAll(io.LimitReader(input, (512<<10)+1))
+			if err != nil || len(data) > 512<<10 {
+				fmt.Fprintln(os.Stderr, "request unreadable or exceeds 512 KiB")
+				return 2
+			}
+			decoder := json.NewDecoder(strings.NewReader(string(data)))
+			decoder.DisallowUnknownFields()
+			if err := decoder.Decode(&req); err != nil {
+				fmt.Fprintln(os.Stderr, err)
+				return 2
+			}
+			if err := decoder.Decode(new(any)); !errors.Is(err, io.EOF) {
+				fmt.Fprintln(os.Stderr, "expected a single JSON object")
+				return 2
+			}
 		}
 		result := executor.Execute(ctx, req)
+		if logs != nil {
+			logs.Close()
+		}
 		if err := json.NewEncoder(os.Stdout).Encode(result); err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			return 1

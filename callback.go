@@ -29,13 +29,13 @@ type CallbackResult struct {
 }
 
 type CallbackEvent struct {
-	Event       string  `json:"event"`
-	TaskID      string  `json:"task_id"`
-	ExecutionID string  `json:"execution_id"`
-	Phase       string  `json:"phase"`
-	Status      string  `json:"status"`
-	Outcome     Outcome `json:"outcome"`
-	UserPostRun Outcome `json:"user_post_run"`
+	Event       string        `json:"event"`
+	TaskID      string        `json:"task_id"`
+	ExecutionID string        `json:"execution_id"`
+	Phase       string        `json:"phase"`
+	Status      string        `json:"status"`
+	Outcome     Outcome       `json:"outcome"`
+	Phases      []PhaseResult `json:"phases"`
 }
 
 type callbackSender struct {

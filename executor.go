@@ -8,6 +8,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
+	"io"
 	"path/filepath"
 	"strings"
 	"time"
@@ -21,6 +22,7 @@ type Outcome = sdk.Outcome
 type TaskRunner = sdk.TaskRunner
 type BaseTask = sdk.BaseTask
 type Status = sdk.Status
+type LogEntry = runner.LogEntry
 
 const (
 	StatusSucceeded = sdk.StatusSucceeded
@@ -37,13 +39,21 @@ type Config struct {
 	PythonPath   string
 	GracePeriod  time.Duration
 	Callback     CallbackConfig
+	// LogWriter optionally receives both stdout and stderr chunks during execution.
+	// Write can be called concurrently and must return promptly; nil disables it.
+	// Streaming is independent of the bounded logs retained in Outcome.
+	LogWriter io.Writer
 }
 
 type PhaseResult struct {
-	Name       string     `json:"name"`
-	Status     string     `json:"status"`
-	StartedAt  *time.Time `json:"started_at"`
-	FinishedAt *time.Time `json:"finished_at"`
+	Name          string     `json:"name"`
+	Status        string     `json:"status"`
+	StartedAt     *time.Time `json:"started_at"`
+	FinishedAt    *time.Time `json:"finished_at"`
+	Logs          []LogEntry `json:"logs"`
+	LogsTruncated bool       `json:"logs_truncated"`
+	Error         string     `json:"error,omitempty"`
+	Stack         string     `json:"stack,omitempty"`
 }
 
 type Result struct {
@@ -53,7 +63,6 @@ type Result struct {
 	Phase       string         `json:"phase"`
 	Phases      []PhaseResult  `json:"phases"`
 	Outcome     Outcome        `json:"outcome"`
-	UserPostRun Outcome        `json:"user_post_run"`
 	Callback    CallbackResult `json:"callback"`
 }
 
@@ -76,6 +85,7 @@ func New(config Config) (*Executor, error) {
 	if config.PythonPath != "" {
 		r.PythonPath = config.PythonPath
 	}
+	r.LogWriter = config.LogWriter
 	// Child working directories are per-execution; resolve explicit relative
 	// executable paths against the caller's directory before changing directories.
 	for _, path := range []*string{&r.GoExecutable, &r.BashPath, &r.PythonPath} {
@@ -149,6 +159,10 @@ func (e *Executor) ExecuteWithObserver(ctx context.Context, executionID string, 
 		Phases:   []PhaseResult{{Name: "prepare", Status: "pending"}, {Name: "run", Status: "pending"}, {Name: "post-run", Status: "pending"}},
 		Callback: CallbackResult{Status: "skipped"},
 	}
+	for i := range result.Phases {
+		result.Phases[i].Logs = []LogEntry{}
+	}
+	var userPostRun Outcome
 	current := -1
 	transition := func(name string) {
 		now := time.Now().UTC()
@@ -172,7 +186,7 @@ func (e *Executor) ExecuteWithObserver(ctx context.Context, executionID string, 
 		}
 	}
 	transition("prepare")
-	result.UserPostRun.Status = "skipped"
+	userPostRun.Status = "skipped"
 	normalized, err := e.Validate(req)
 	if err != nil {
 		result.Outcome = Outcome{Status: StatusFailed, Error: fmt.Errorf("invalid_request: %w", err)}
@@ -183,7 +197,13 @@ func (e *Executor) ExecuteWithObserver(ctx context.Context, executionID string, 
 			}
 			transition(name)
 		})
-		result.Outcome, result.UserPostRun = report.Outcome, report.UserPostRun
+		result.Outcome, userPostRun = report.Outcome, report.UserPostRun
+		for i := range result.Phases {
+			if logs := report.PhaseLogs[result.Phases[i].Name]; logs != nil {
+				result.Phases[i].Logs = logs.Logs
+				result.Phases[i].LogsTruncated = logs.Truncated
+			}
+		}
 	}
 	result.Status = string(result.Outcome.Status)
 	primaryPhase := 0
@@ -191,24 +211,40 @@ func (e *Executor) ExecuteWithObserver(ctx context.Context, executionID string, 
 		primaryPhase = 1
 	}
 	result.Phases[primaryPhase].Status = result.Status
+	if result.Outcome.Error != nil {
+		result.Phases[primaryPhase].Error = result.Outcome.Error.Error()
+		result.Phases[primaryPhase].Stack = result.Outcome.Stack
+	}
 	if result.Phases[1].StartedAt == nil {
 		result.Phases[1].Status = "skipped"
 	}
 	if current != 2 {
 		transition("post-run")
 	}
+	// The callback carries cleanup diagnostics in phases, not a separate Outcome.
+	if userPostRun.Error != nil {
+		result.Phases[2].Error = "user post-run: " + userPostRun.Error.Error()
+		result.Phases[2].Stack = userPostRun.Stack
+		result.Phases[2].Status = "failed"
+	}
 	if req.CallbackURL != "" {
 		// Delivery is deliberately independent of the cancelled execution context.
 		result.Callback = e.callback.send(req.CallbackURL, CallbackEvent{
 			Event: "task.completed", TaskID: req.TaskID, ExecutionID: executionID,
-			Phase: "post-run", Status: result.Status, Outcome: result.Outcome, UserPostRun: result.UserPostRun,
+			Phase: "post-run", Status: result.Status, Outcome: result.Outcome, Phases: result.Phases,
 		})
 	}
 	now := time.Now().UTC()
 	result.Phases[2].FinishedAt = &now
 	result.Phases[2].Status = "succeeded"
-	if result.Callback.Status == "failed" || (result.UserPostRun.Status != "succeeded" && result.UserPostRun.Status != "skipped") {
+	if result.Callback.Status == "failed" || (userPostRun.Status != "succeeded" && userPostRun.Status != "skipped") {
 		result.Phases[2].Status = "failed"
+	}
+	if result.Callback.Status == "failed" {
+		if result.Phases[2].Error != "" {
+			result.Phases[2].Error += "; "
+		}
+		result.Phases[2].Error += "callback: " + result.Callback.Error
 	}
 	return result
 }

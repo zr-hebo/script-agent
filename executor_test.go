@@ -1,6 +1,7 @@
 package scriptagent_test
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -10,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -304,6 +306,233 @@ func TestCLI(t *testing.T) {
 	}
 	if result.Status != "succeeded" || result.Outcome.Data["cluster_uuid"] != "cli" {
 		t.Fatalf("%+v", result)
+	}
+}
+
+func TestCLICustomSource(t *testing.T) {
+	for _, tc := range []struct {
+		name, params string
+		code         int
+	}{
+		{"success", `{"cluster_uuid":"cluster-001","dry_run":true}`, 0},
+		{"false and spaces", `{"cluster_uuid":"cluster with spaces","dry_run":false}`, 0},
+		{"default dry run", `{"cluster_uuid":"cluster-001"}`, 0},
+		{"missing cluster", `{}`, 1},
+		{"invalid dry run", `{"cluster_uuid":"cluster-001","dry_run":"false"}`, 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cmd := exec.Command(helperPath, "run", "--source", "examples/custom/example.go", "--params", tc.params)
+			output, err := cmd.Output()
+			if cmd.ProcessState == nil || cmd.ProcessState.ExitCode() != tc.code {
+				t.Fatalf("unexpected exit: %v, output=%s", err, output)
+			}
+			var result agent.Result
+			if err := json.Unmarshal(output, &result); err != nil {
+				t.Fatal(err, string(output))
+			}
+			if tc.code == 0 {
+				var params map[string]any
+				_ = json.Unmarshal([]byte(tc.params), &params)
+				dryRun, exists := params["dry_run"]
+				if !exists {
+					dryRun = true
+				}
+				if result.Status != "succeeded" || result.Outcome.Data["cluster_uuid"] != params["cluster_uuid"] || result.Outcome.Data["dry_run"] != dryRun || result.Outcome.Error != nil {
+					t.Fatalf("unexpected result: %+v", result)
+				}
+			} else if result.Status != "failed" || result.Outcome.Error == nil {
+				t.Fatalf("expected business failure: %+v", result)
+			}
+		})
+	}
+}
+
+func TestCLISourceInvalidArguments(t *testing.T) {
+	for _, args := range [][]string{
+		{"run", "--source", "examples/custom/example.go", "--file", "-"},
+		{"run", "--source", ""},
+		{"run", "--params", "{}"},
+		{"run", "--language", "go"},
+		{"serve", "--source", "examples/custom/example.go"},
+		{"serve", "--stream-logs=true"},
+		{"run", "--source", "missing-script.go"},
+		{"run", "--source", "examples/custom/example.go", "--language", "ruby"},
+		{"run", "--source", "examples/custom/example.go", "--params", "[]"},
+		{"run", "--source", "examples/custom/example.go", "--params", "null"},
+		{"run", "--source", "examples/custom/example.go", "--params", "true"},
+		{"run", "--source", "examples/custom/example.go", "--params", "{"},
+		{"run", "--source", "examples/custom/example.go", "--params", "{} {}"},
+	} {
+		t.Run(strings.Join(args, " "), func(t *testing.T) {
+			cmd := exec.Command(helperPath, args...)
+			output, err := cmd.CombinedOutput()
+			if err == nil || cmd.ProcessState == nil || cmd.ProcessState.ExitCode() != 2 {
+				t.Fatalf("expected input error: %v, output=%s", err, output)
+			}
+		})
+	}
+}
+
+// readyLog detects a marker even when the pipe splits it across writes.
+type readyLog struct {
+	buffer bytes.Buffer
+	ready  chan struct{}
+	once   sync.Once
+}
+
+func (w *readyLog) Write(p []byte) (int, error) {
+	n, err := w.buffer.Write(p)
+	if strings.Contains(w.buffer.String(), "run-ready") {
+		w.once.Do(func() { close(w.ready) })
+	}
+	return n, err
+}
+
+func (w *readyLog) String() string { return w.buffer.String() }
+
+func TestCLIStreamsBeforeTaskCompletes(t *testing.T) {
+	for _, tc := range []struct{ language, source, prepare, post string }{
+		{"go", `package usercode
+import ("context"; "fmt"; "os"; "time"; "github.com/zr-hebo/script-agent/sdk")
+type Task struct{}
+func New() sdk.TaskRunner { return &Task{} }
+func (t *Task) Prepare(ctx context.Context, p map[string]any) error { fmt.Println("prepare-log"); return nil }
+func (t *Task) Run(ctx context.Context, p map[string]any) sdk.Outcome {
+ fmt.Println("run-ready\nrun-second")
+ for { if _, err := os.Stat(p["marker"].(string)); err == nil { break }; time.Sleep(10*time.Millisecond) }
+ fmt.Fprintln(os.Stderr, "error-stream-log")
+ return sdk.Outcome{Status:sdk.StatusSucceeded}
+}
+func (t *Task) PostRun(ctx context.Context, p map[string]any, out sdk.Outcome) error { fmt.Println("post-log"); return nil }
+`, "", ""},
+		{"python", `import os, sys, time
+def prepare(params):
+    print("prepare-log")
+def run(params):
+    print("run-ready\nrun-second")
+    while not os.path.exists(params["marker"]):
+        time.sleep(0.01)
+    print("error-stream-log", file=sys.stderr)
+    return {"status": "succeeded", "data": None, "error": None}
+def post_run(params, outcome):
+    print("post-log")
+`, "", ""},
+		{"shell", `echo run-ready
+echo run-second
+python3 - <<'PY'
+import json, os, time
+with open(os.environ['SCRIPT_PARAMS_FILE']) as f:
+    params = json.load(f)
+while not os.path.exists(params['marker']):
+    time.sleep(0.01)
+PY
+echo error-stream-log >&2`, "echo prepare-log", "echo post-log"},
+	} {
+		t.Run(tc.language, func(t *testing.T) {
+			marker := filepath.Join(t.TempDir(), "release")
+			body, _ := json.Marshal(agent.Request{Language: tc.language, Source: tc.source, PrepareSource: tc.prepare, PostRunSource: tc.post, Params: map[string]any{"marker": marker}, TimeoutSeconds: 10})
+			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			defer cancel()
+			cmd := exec.CommandContext(ctx, helperPath, "run")
+			var stdout bytes.Buffer
+			stderr := &readyLog{ready: make(chan struct{})}
+			cmd.Stdin, cmd.Stdout, cmd.Stderr = bytes.NewReader(body), &stdout, stderr
+			if err := cmd.Start(); err != nil {
+				t.Fatal(err)
+			}
+			waited := false
+			defer func() {
+				if !waited {
+					// Release the script on assertion failure, too.
+					_ = os.WriteFile(marker, nil, 0600)
+					_ = cmd.Wait()
+				}
+			}()
+			select {
+			case <-stderr.ready:
+			case <-time.After(5 * time.Second):
+				t.Fatal("no live log while task was still running")
+			}
+			if err := os.WriteFile(marker, nil, 0600); err != nil {
+				t.Fatal(err)
+			}
+			err := cmd.Wait()
+			waited = true
+			if err != nil {
+				t.Fatalf("%v: %s", err, stderr.String())
+			}
+			var result agent.Result
+			if err := json.Unmarshal(stdout.Bytes(), &result); err != nil || result.Status != "succeeded" {
+				t.Fatalf("invalid final JSON: %s, %v", stdout.String(), err)
+			}
+			var fields map[string]json.RawMessage
+			_ = json.Unmarshal(stdout.Bytes(), &fields)
+			if _, exists := fields["user_post_run"]; exists {
+				t.Fatal("user_post_run is still exposed")
+			}
+			for i, messages := range [][]string{{"prepare-log"}, {"run-ready", "run-second", "error-stream-log"}, {"post-log"}} {
+				phase := result.Phases[i]
+				if len(phase.Logs) != len(messages) || phase.LogsTruncated {
+					t.Fatalf("unexpected phase logs: %+v", phase)
+				}
+				for _, message := range messages {
+					found := false
+					for _, log := range phase.Logs {
+						stream := "stdout"
+						if message == "error-stream-log" {
+							stream = "stderr"
+						}
+						found = found || (log.Message == message && log.Stream == stream)
+					}
+					if !found {
+						t.Fatalf("missing %s in %+v", message, phase)
+					}
+				}
+			}
+			for _, log := range []string{"prepare-log", "run-ready", "post-log", "error-stream-log"} {
+				if !strings.Contains(stderr.String(), log) {
+					t.Fatalf("missing %s in %s", log, stderr.String())
+				}
+			}
+		})
+	}
+}
+
+func TestCLIStreamLogsSwitch(t *testing.T) {
+	for _, enabled := range []bool{false, true} {
+		cmd := exec.Command(helperPath, "run", "--source", "examples/custom/example.go", "--params", `{"cluster_uuid":"cli"}`, fmt.Sprintf("--stream-logs=%t", enabled))
+		var stderr bytes.Buffer
+		cmd.Stderr = &stderr
+		output, err := cmd.Output()
+		if err != nil {
+			t.Fatalf("%v: %s", err, stderr.String())
+		}
+		var result agent.Result
+		if err := json.Unmarshal(output, &result); err != nil || !strings.Contains(result.Outcome.Stdout, "processing") {
+			t.Fatalf("capture changed: %s, %v", output, err)
+		}
+		if strings.Contains(stderr.String(), "processing") != enabled || (!enabled && stderr.Len() != 0) {
+			t.Fatalf("enabled=%t stderr=%s", enabled, stderr.String())
+		}
+	}
+}
+
+func TestCLIStreamLogsBrokenPipe(t *testing.T) {
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = r.Close()
+	defer w.Close()
+	cmd := exec.Command(helperPath, "run", "--source", "examples/custom/example.go", "--params", `{"cluster_uuid":"cli"}`)
+	cmd.Stderr = w
+	output, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("broken log pipe interrupted task: %v, %s", err, output)
+	}
+	var result agent.Result
+	if err := json.Unmarshal(output, &result); err != nil || result.Status != "succeeded" {
+		t.Fatalf("invalid final result: %s, %v", output, err)
 	}
 }
 

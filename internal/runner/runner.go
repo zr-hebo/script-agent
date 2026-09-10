@@ -2,9 +2,12 @@ package runner
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -20,6 +23,7 @@ type Runner struct {
 	BashPath     string
 	PythonPath   string
 	GracePeriod  time.Duration
+	LogWriter    io.Writer
 }
 
 func New() (*Runner, error) {
@@ -33,6 +37,13 @@ func (r *Runner) ExecuteWithPhase(ctx context.Context, request Request, phase fu
 	req, err := request.Normalize()
 	if err != nil {
 		return failure("invalid_request", err)
+	}
+	var paramEnv []string
+	if req.Language == "shell" {
+		paramEnv, err = paramsEnvironment(req.Params)
+		if err != nil {
+			return failure("invalid_request", err)
+		}
 	}
 	ctx, cancel := context.WithTimeout(ctx, timeoutDuration(req))
 	defer cancel()
@@ -61,13 +72,25 @@ func (r *Runner) ExecuteWithPhase(ctx context.Context, request Request, phase fu
 		"SCRIPT_POST_RUN_TIMEOUT_SECONDS=" + strconv.Itoa(req.PostRunTimeoutSeconds),
 		"SCRIPT_INTERRUPT_FILE=" + filepath.Join(dir, "interrupt.status"),
 	}
-	stdout, stderr := &limitedLog{}, &limitedLog{}
+	env = append(env, paramEnv...)
+	stdout, stderr := &limitedLog{stream: r.LogWriter}, &limitedLog{stream: r.LogWriter}
+	var token [16]byte
+	if _, err := rand.Read(token[:]); err != nil {
+		return failure("setup_error", err)
+	}
+	prefix := "\x1escript-agent:" + hex.EncodeToString(token[:]) + ":"
+	env = append(env, "SCRIPT_LOG_MARKER="+prefix)
+	logs := newPhaseLogStore()
+	output, errorOutput := newPhaseLogWriter(stdout, logs, "stdout", prefix), newPhaseLogWriter(stderr, logs, "stderr", prefix)
 	defer func() {
+		output.close()
+		errorOutput.close()
+		result.PhaseLogs = logs.phases
 		result.Stdout, result.StdoutTruncated = stdout.text(), stdout.truncated
 		result.Stderr, result.StderrTruncated = stderr.text(), stderr.truncated
 	}()
 	if req.Language == "shell" {
-		return r.executeShell(ctx, req, dir, env, stdout, stderr, phase)
+		return r.executeShell(ctx, req, dir, env, output, errorOutput, phase)
 	}
 	var cmd *exec.Cmd
 	if req.Language == "go" {
@@ -79,7 +102,7 @@ func (r *Runner) ExecuteWithPhase(ctx context.Context, request Request, phase fu
 		}
 		cmd = exec.Command(r.PythonPath, "-I", "-u", wrapper, sourcePath, paramsPath, resultPath, postPath)
 	}
-	cmd.Dir, cmd.Env, cmd.Stdout, cmd.Stderr = dir, env, stdout, stderr
+	cmd.Dir, cmd.Env, cmd.Stdout, cmd.Stderr = dir, env, output, errorOutput
 	state := runLifecycleProcess(ctx, cmd, r.GracePeriod, time.Duration(req.PostRunTimeoutSeconds)*time.Second, phase)
 	out, readErr := readOutcome(resultPath, false)
 	if readErr != nil {
@@ -129,9 +152,13 @@ func readOutcome(path string, allowSkipped bool) (sdk.Outcome, error) {
 	return out, out.Validate()
 }
 
-func (r *Runner) executeShell(ctx context.Context, req Request, dir string, env []string, stdout, stderr *limitedLog, phase func(string)) (result Result) {
+func (r *Runner) executeShell(ctx context.Context, req Request, dir string, env []string, stdout, stderr *phaseLogWriter, phase func(string)) (result Result) {
 	result.UserPostRun.Status = "skipped"
 	runStage := func(ctx context.Context, name, source string) sdk.Outcome {
+		stdout.setPhase(name)
+		stderr.setPhase(name)
+		defer stdout.close()
+		defer stderr.close()
 		path := filepath.Join(dir, name+".sh")
 		if err := os.WriteFile(path, []byte(source), 0600); err != nil {
 			return failure("setup_error", err).Outcome
@@ -174,8 +201,8 @@ func (r *Runner) executeShell(ctx context.Context, req Request, dir string, env 
 			}
 		}
 	}
-	result.Stdout, result.Stderr = stdout.text(), stderr.text()
-	result.StdoutTruncated, result.StderrTruncated = stdout.truncated, stderr.truncated
+	result.Stdout, result.Stderr = stdout.capture.text(), stderr.capture.text()
+	result.StdoutTruncated, result.StderrTruncated = stdout.capture.truncated, stderr.capture.truncated
 	phase("post-run")
 	if req.PostRunSource != "" {
 		if err := writeOutcome(filepath.Join(dir, "outcome.json"), result.Outcome); err != nil {
@@ -200,10 +227,15 @@ func interrupted(err error) Result {
 type limitedLog struct {
 	data      []byte
 	truncated bool
+	stream    io.Writer
 }
 
 func (b *limitedLog) Write(p []byte) (int, error) {
 	n := len(p)
+	if b.stream != nil {
+		// Streaming failure must not stop draining the child's output pipes.
+		_, _ = b.stream.Write(p)
+	}
 	remaining := MaxLogBytes - len(b.data)
 	if len(p) > remaining {
 		p = p[:remaining]

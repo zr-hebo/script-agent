@@ -43,8 +43,8 @@ func (t *Task) PostRun(ctx context.Context, p map[string]any, out sdk.Outcome) e
 func TestGoTaskRunnerLifecycle(t *testing.T) {
 	e := executor(t, agent.CallbackConfig{})
 	out := e.Execute(context.Background(), agent.Request{Language: "go", Source: goTask})
-	if out.Status != "succeeded" || out.UserPostRun.Status != "succeeded" {
-		t.Fatalf("%+v, primary=%v post=%v stderr=%s", out, out.Outcome.Error, out.UserPostRun.Error, out.Outcome.Stderr)
+	if out.Status != "succeeded" || out.Phases[2].Status != "succeeded" {
+		t.Fatalf("%+v, primary=%v post=%v stderr=%s", out, out.Outcome.Error, out.Phases[2].Error, out.Outcome.Stderr)
 	}
 	if out.Outcome.Data["count"] != float64(42) || out.Outcome.Data["prepared"] != true {
 		t.Fatal(out.Outcome.Data)
@@ -56,6 +56,9 @@ func TestGoTaskRunnerLifecycle(t *testing.T) {
 		if phase.Status != "succeeded" {
 			t.Fatal(out.Phases)
 		}
+		if len(phase.Logs) != 1 || phase.Logs[0].Message != phase.Name || phase.Logs[0].Stream != "stdout" {
+			t.Fatalf("fast Go phase logs misattributed: %+v", phase)
+		}
 	}
 }
 
@@ -66,8 +69,8 @@ type Task struct { sdk.BaseTask }
 func New() sdk.TaskRunner { return &Task{} }
 func (t *Task) Run(ctx context.Context, p map[string]any) sdk.Outcome { return sdk.Outcome{Status:sdk.StatusSucceeded,Data:p} }`
 	out := executor(t, agent.CallbackConfig{}).Execute(context.Background(), agent.Request{Language: "go", Source: source, Params: map[string]any{"cluster_uuid": "c1"}})
-	if out.Status != "succeeded" || out.UserPostRun.Status != "succeeded" {
-		t.Fatalf("primary=%v post=%v stderr=%s", out.Outcome.Error, out.UserPostRun.Error, out.Outcome.Stderr)
+	if out.Status != "succeeded" || out.Phases[2].Status != "succeeded" {
+		t.Fatalf("primary=%v post=%v stderr=%s", out.Outcome.Error, out.Phases[2].Error, out.Outcome.Stderr)
 	}
 }
 
@@ -120,8 +123,8 @@ def post_run(params, outcome):
     outcome["data"]["cluster_uuid"] = "changed"
 `} {
 		out := executor(t, agent.CallbackConfig{}).Execute(context.Background(), agent.Request{Language: "python", Source: source, Params: map[string]any{"cluster_uuid": "c1"}})
-		if out.Status != "succeeded" || out.Outcome.Data["cluster_uuid"] != "c1" || out.UserPostRun.Status == "failed" {
-			t.Fatalf("%+v %v %v", out, out.Outcome.Error, out.UserPostRun.Error)
+		if out.Status != "succeeded" || out.Outcome.Data["cluster_uuid"] != "c1" || out.Phases[2].Status == "failed" {
+			t.Fatalf("%+v %v %v", out, out.Outcome.Error, out.Phases[2].Error)
 		}
 	}
 }
@@ -139,8 +142,13 @@ assert out["status"] == "succeeded" and out["error"] is None
 PY
 echo post-run`,
 	})
-	if out.Status != "succeeded" || out.UserPostRun.Status != "succeeded" || out.Outcome.Stdout != "prepare\nrun\npost-run\n" {
+	if out.Status != "succeeded" || out.Phases[2].Status != "succeeded" || out.Outcome.Stdout != "prepare\nrun\npost-run\n" {
 		t.Fatalf("%+v", out)
+	}
+	for _, phase := range out.Phases {
+		if len(phase.Logs) != 1 || phase.Logs[0].Message != phase.Name {
+			t.Fatalf("fast Shell phase logs misattributed: %+v", phase)
+		}
 	}
 }
 
@@ -163,11 +171,11 @@ func TestPostRunFailureStillCallbacks(t *testing.T) {
 	} {
 		req.CallbackURL = callback.URL
 		out := e.Execute(context.Background(), req)
-		if out.Status != "succeeded" || out.UserPostRun.Status != "failed" || out.Callback.Status != "succeeded" || out.Phases[2].Status != "failed" {
-			t.Fatalf("%+v %v %v", out, out.Outcome.Error, out.UserPostRun.Error)
+		if out.Status != "succeeded" || out.Phases[2].Status != "failed" || out.Callback.Status != "succeeded" {
+			t.Fatalf("%+v %v %v", out, out.Outcome.Error, out.Phases[2].Error)
 		}
 		event := <-events
-		if event.Status != "succeeded" || event.UserPostRun.Status != "failed" || event.UserPostRun.Error == nil {
+		if event.Status != "succeeded" || event.Phases[2].Status != "failed" || event.Phases[2].Error == "" {
 			t.Fatal(event)
 		}
 	}
@@ -183,8 +191,8 @@ func TestPostRunTimeoutPreservesRun(t *testing.T) {
 		req.PostRunTimeoutSeconds = 1
 		start := time.Now()
 		out := e.Execute(context.Background(), req)
-		if out.Status != "succeeded" || out.UserPostRun.Status != "timed_out" || time.Since(start) > 4*time.Second {
-			t.Fatalf("%+v %v %v", out, out.Outcome.Error, out.UserPostRun.Error)
+		if out.Status != "succeeded" || out.Phases[2].Status != "failed" || !strings.Contains(out.Phases[2].Error, "deadline exceeded") || time.Since(start) > 4*time.Second {
+			t.Fatalf("%+v %v %v", out, out.Outcome.Error, out.Phases[2].Error)
 		}
 	}
 }
@@ -209,8 +217,8 @@ def post_run(p,out):
 		{Language: "shell", PrepareSource: "exit 4", Source: "echo should-not-run", PostRunSource: "echo post-run"},
 	} {
 		out := e.Execute(context.Background(), req)
-		if out.Status != "failed" || out.Phases[0].Status != "failed" || out.Phases[1].Status != "skipped" || out.UserPostRun.Status != "succeeded" {
-			t.Fatalf("language=%s phases=%+v error=%v cleanup=%v stderr=%s", req.Language, out.Phases, out.Outcome.Error, out.UserPostRun.Error, out.Outcome.Stderr)
+		if out.Status != "failed" || out.Phases[0].Status != "failed" || out.Phases[1].Status != "skipped" || out.Phases[2].Status != "succeeded" {
+			t.Fatalf("language=%s phases=%+v error=%v cleanup=%v stderr=%s", req.Language, out.Phases, out.Outcome.Error, out.Phases[2].Error, out.Outcome.Stderr)
 		}
 		if !strings.Contains(out.Outcome.Stdout, "post-run") || strings.Contains(out.Outcome.Stdout, "should-not-run") {
 			t.Fatal(out.Outcome.Stdout)
@@ -235,15 +243,15 @@ func(t *Task) PostRun(ctx context.Context,p map[string]any,out sdk.Outcome) erro
  if out.Status!=sdk.StatusFailed || out.Error==nil { return fmt.Errorf("invalid cleanup outcome") }; return nil
 }`
 		out := e.Execute(context.Background(), agent.Request{Language: "go", Source: source})
-		if out.Status != "failed" || out.UserPostRun.Status != "succeeded" {
-			t.Fatalf("%v %v stderr=%s", out.Outcome.Error, out.UserPostRun.Error, out.Outcome.Stderr)
+		if out.Status != "failed" || out.Phases[2].Status != "succeeded" {
+			t.Fatalf("%v %v stderr=%s", out.Outcome.Error, out.Phases[2].Error, out.Outcome.Stderr)
 		}
 	}
 	for _, body := range []string{`{}`, `{"status":"succeeded","error":"bad"}`, `{"status":"failed","error":None}`, `{"status":"skipped","error":None}`, `{"status":"failed","error":{}}`} {
 		source := "def run(p):\n    return " + body + "\ndef post_run(p,out):\n    assert out['status']=='failed' and out['error']\n"
 		out := e.Execute(context.Background(), agent.Request{Language: "python", Source: source})
-		if out.Status != "failed" || out.UserPostRun.Status != "succeeded" {
-			t.Fatalf("%v %v", out.Outcome.Error, out.UserPostRun.Error)
+		if out.Status != "failed" || out.Phases[2].Status != "succeeded" {
+			t.Fatalf("%v %v", out.Outcome.Error, out.Phases[2].Error)
 		}
 	}
 }
@@ -276,8 +284,8 @@ def post_run(p,out):
 	} {
 		req.TimeoutSeconds, req.PostRunTimeoutSeconds = 1, 2
 		out := e.Execute(context.Background(), req)
-		if out.Status != "timed_out" || out.UserPostRun.Status != "succeeded" || !strings.Contains(out.Outcome.Stdout, "cleaned") {
-			t.Fatalf("language=%s status=%s error=%v cleanup=%v stderr=%s", req.Language, out.Status, out.Outcome.Error, out.UserPostRun.Error, out.Outcome.Stderr)
+		if out.Status != "timed_out" || out.Phases[2].Status != "succeeded" || !strings.Contains(out.Outcome.Stdout, "cleaned") {
+			t.Fatalf("language=%s status=%s error=%v cleanup=%v stderr=%s", req.Language, out.Status, out.Outcome.Error, out.Phases[2].Error, out.Outcome.Stderr)
 		}
 	}
 }
@@ -298,7 +306,7 @@ def post_run(p,out):
 			cancel()
 		}
 	})
-	if out.Status != "succeeded" || out.UserPostRun.Status != "succeeded" {
+	if out.Status != "succeeded" || out.Phases[2].Status != "succeeded" {
 		t.Fatalf("%+v", out)
 	}
 }

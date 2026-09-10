@@ -68,12 +68,18 @@ func (r Request) Normalize() (Request, error) {
 		return r, err
 	}
 	r.Params = snapshot
+	if r.Language == "shell" {
+		if _, err := paramsEnvironment(r.Params); err != nil {
+			return r, err
+		}
+	}
 	return r, nil
 }
 
 type Result struct {
 	sdk.Outcome
 	UserPostRun sdk.Outcome
+	PhaseLogs   map[string]*PhaseLogs
 }
 
 func failure(kind string, err error) Result {

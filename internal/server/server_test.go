@@ -70,6 +70,27 @@ func waitFor(t *testing.T, s *Server, id string, condition func(Execution) bool)
 	return Execution{}
 }
 
+func TestRejectInvalidParameterEnvironment(t *testing.T) {
+	s := testServer(t, 1, 4, agent.CallbackConfig{})
+	for _, params := range []map[string]any{
+		{"bad-key": "value"},
+		{"name": "one", "NAME": "two"},
+		{"value": "secret\x00value"},
+	} {
+		body, err := json.Marshal(agent.Request{Language: "shell", Source: "echo must-not-run", Params: params})
+		if err != nil {
+			t.Fatal(err)
+		}
+		w := request(s, "POST", "/v1/executions", body)
+		if w.Code != http.StatusBadRequest || len(s.entries) != 0 {
+			t.Fatalf("invalid params created a task: %d %s", w.Code, w.Body.String())
+		}
+		if strings.Contains(w.Body.String(), "secret") {
+			t.Fatal("parameter value leaked in response")
+		}
+	}
+}
+
 func TestSubmitGetAndCancel(t *testing.T) {
 	s := testServer(t, 2, 8, agent.CallbackConfig{})
 	item := submitTask(t, s, agent.Request{TaskID: "task-001", Language: "shell", Source: "echo hello"})
@@ -157,7 +178,7 @@ def post_run(p,out):
     raise ValueError("cleanup failure")
 `})
 	finished := waitFor(t, s, item.ExecutionID, func(e Execution) bool { return e.FinishedAt != nil })
-	if finished.Status != "failed" || finished.Result.Outcome.Error.Error() != "business failure" || finished.Result.UserPostRun.Error == nil {
+	if finished.Status != "failed" || finished.Result.Outcome.Error.Error() != "business failure" || finished.Result.Phases[2].Error == "" {
 		t.Fatalf("%+v", finished.Result)
 	}
 	if finished.Result.Phases[0].Status != "succeeded" || finished.Result.Phases[1].Status != "failed" || finished.Result.Phases[2].Status != "failed" {

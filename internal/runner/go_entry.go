@@ -67,7 +67,12 @@ func GoEntry(ctx context.Context, sourcePath, paramsPath, resultPath, postPath s
 	if phaseFile != nil {
 		defer phaseFile.Close()
 	}
+	logPrefix := os.Getenv("SCRIPT_LOG_MARKER")
 	notify := func(phase string) {
+		if logPrefix != "" {
+			_, _ = fmt.Fprint(os.Stdout, logPrefix+phase+"\x1f")
+			_, _ = fmt.Fprint(os.Stderr, logPrefix+phase+"\x1f")
+		}
 		if phaseFile != nil {
 			_ = json.NewEncoder(phaseFile).Encode(map[string]string{"phase": phase})
 		}

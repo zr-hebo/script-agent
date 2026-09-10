@@ -9,6 +9,7 @@ import traceback
 
 source_path, params_path, result_path, post_path = sys.argv[1:]
 events = os.fdopen(3, "w", buffering=1)
+log_prefix = os.environ.get("SCRIPT_LOG_MARKER")
 
 class Cancelled(BaseException):
     pass
@@ -20,6 +21,12 @@ signal.signal(signal.SIGTERM, interrupted)
 signal.signal(signal.SIGINT, interrupted)
 
 def notify(phase):
+    sys.stdout.flush()
+    sys.stderr.flush()
+    if log_prefix:
+        marker = (log_prefix + phase + "\x1f").encode()
+        os.write(1, marker)
+        os.write(2, marker)
     events.write(json.dumps({"phase": phase}) + "\n")
     events.flush()
 
