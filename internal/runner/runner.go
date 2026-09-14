@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/zr-hebo/script-agent/sdk"
@@ -160,6 +161,9 @@ func (r *Runner) executeShell(ctx context.Context, req Request, dir string, env 
 		defer stdout.close()
 		defer stderr.close()
 		path := filepath.Join(dir, name+".sh")
+		// Accept Windows line endings in every Shell phase without stripping
+		// standalone carriage returns or changing parameter values.
+		source = strings.ReplaceAll(source, "\r\n", "\n")
 		if err := os.WriteFile(path, []byte(source), 0600); err != nil {
 			return failure("setup_error", err).Outcome
 		}

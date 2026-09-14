@@ -337,6 +337,8 @@ Request 使用三个源码字段：
 
 省略 prepare_source/post_run_source 即空实现。这两个字段仅用于 Shell；Go/Python 通过源码内的方法/函数定义钩子。
 
+Shell 源码支持 LF、CRLF 和混合换行。Agent 在写入各阶段脚本文件前，将 `prepare_source`、`source`、`post_run_source` 中的 CRLF（`\r\n`）统一转换为 LF（`\n`），无需手动转换 Windows 格式文件。单独的 `\r`、参数值及 Go/Python 源码保持不变；CLI、HTTP 和 Go package 使用同一处理逻辑。
+
 - 每阶段为独立 Bash 进程，共享当前 Task 工作目录；文件可以跨阶段传递，shell 变量和 export 不会自动跨进程保留。
 - 所有阶段均可通过 `PARAM_*` 环境变量读取参数，也可通过 `SCRIPT_PARAMS_FILE` 读取 JSON Map（保留 `BATCH_PARAMS_FILE` 兼容别名），不通过 eval 或源码插值传参。
 - Run 退出码 0 表示成功，非零表示失败；Agent 将其转换成统一 Outcome。
